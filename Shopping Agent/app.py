@@ -193,14 +193,14 @@ def render_message(text: str, key_prefix: str = ""):
     for num, name, pid, price, rating, organic in products:
         tag_class = "tag-organic" if organic.lower() == "organic" else "tag-regular"
         rating_display = "No ratings yet" if rating.upper().replace("/", "") == "NA" else f"★ {rating} / 5"
-        cards_html += f"""
-            <div class="product-card">
-                <span class="product-tag {tag_class}">{organic.title()}</span>
-                <div class="product-name">#{num}. {name}</div>
-                <div class="product-price">${price}</div>
-                <div class="product-rating">{rating_display}</div>
-            </div>
-        """
+        cards_html += (
+            f'<div class="product-card">'
+            f'<span class="product-tag {tag_class}">{organic.title()}</span>'
+            f'<div class="product-name">#{num}. {name}</div>'
+            f'<div class="product-price">${price}</div>'
+            f'<div class="product-rating">{rating_display}</div>'
+            f'</div>'
+        )
     cards_html += "</div>"
     st.markdown(cards_html, unsafe_allow_html=True)
 

@@ -14,6 +14,10 @@ load_dotenv()
 
 DB_PATH = os.path.join(os.path.dirname(__file__),"store.db")
 
+
+#single user local assitant
+USER_ID = "default_user"
+
 llm = ChatGroq(model= "openai/gpt-oss-120b", temperature=0)
 vision_llm = ChatGroq(model="qwen/qwen3.8-27b", temperature= 0)
 
@@ -91,8 +95,8 @@ def checkout(product_id: int)-> str:
 
     name, price = row
     cursor.execute(
-        "INSERT INTO orders (product_id, product_name, price) VALUES (?, ?, ?)",
-        (product_id, name, price),
+        "INSERT INTO orders (product_id, product_name, price, user_id) VALUES (?, ?, ?, ?)",
+        (product_id, name, price, USER_ID),
     )
     order_id = cursor.lastrowid
     conn.commit()
@@ -137,12 +141,107 @@ def describe_product_image(image_path: str) -> str:
     response = vision_llm.invoke([message])
     return response.content
 
+@tool
+def get_order_history(limit: int = 10)-> str:
+    """
+    Get the current user's past orders, most recent first.
+    Returns a JSON array of orders, each with: order_id, product_id, product_name, price, ordered_at.
+    Use this to answer questions like "what have I ordered before?" or "did I already buy X?".
+    Do NOT use search_products for these questions
+    """
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute(
+         """
+        SELECT id, product_id, product_name, price, ordered_at
+        FROM orders WHERE user_id = ? ORDER BY ordered_at DESC LIMIT ?
+        """,
+        (USER_ID, limit),
+    )
+    rows = cursor.fetchall()
+    conn.close()
+
+    orders = [
+        {
+            "order_id":     row[0],
+            "product_id":   row[1],
+            "product_name": row[2],
+            "price":        row[3],
+            "ordered_at":   row[4],
+        }
+        for row in rows
+    ]
+    return json.dumps(orders)
+
+@tool
+def get_preferences() -> str:
+    """
+    Get the current user's saved shopping preferences.
+    Returns a JSON object: {prefers_organic, max_price}. Either field may be null if never set.
+    Call this once at the start of a BROWSING request so saved preferences can be applied
+    automatically when the user doesn't repeat them in the current message.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT prefers_organic, max_price FROM preferences WHERE user_id = ?", (USER_ID,)
+    )
+    row = cursor.fetchone()
+    conn.close()
+
+    if not row:
+        return json.dumps({"prefers_organic": None, "max_price": None})
+
+    return json.dumps({
+        "prefers_organic": bool(row[0]) if row[0] is not None else None,
+        "max_price": row[1],
+    })
+
+@tool
+def update_preferences(prefers_organic: Optional[bool] = None, max_price: Optional[float] = None) -> str:
+    """
+    Save or update the current user's standing shopping preferences.
+    Only pass a field when the user actually stated a lasting preference, e.g.:
+    "I always want organic" -> prefers_organic=True
+    "never show me anything over $20" -> max_price=20
+    Leave a field as None to keep its previously saved value unchanged. Do NOT call this
+    for a one-off filter mentioned for a single search only.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute(
+            "SELECT prefers_organic, max_price FROM preferences WHERE user_id = ?", (USER_ID,)
+        )
+    row = cursor.fetchone()
+    existing_organic, existing_max = row if row else (None, None)
+    new_organic = existing_organic if prefers_organic is None else (1 if prefers_organic else 0)
+    new_max = existing_max if max_price is None else max_price
+    
+    cursor.execute(
+        """
+        INSERT INTO preferences (user_id, prefers_organic, max_price, updated_at)
+        VALUES (?, ?, ?, datetime('now'))
+        ON CONFLICT(user_id) DO UPDATE SET
+            prefers_organic = excluded.prefers_organic,
+            max_price       = excluded.max_price,
+            updated_at      = excluded.updated_at
+        """,
+        (USER_ID, new_organic, new_max),
+    )
+    conn.commit()
+    conn.close()
+    return "Preferences saved."
+
+
+
+
+
 # ---------------------------------------------------------------------------
 # Agent
 # ---------------------------------------------------------------------------
 
 agent = create_agent(
-    tools = [search_product,get_rating,checkout,describe_product_image],
+    tools = [search_product,get_rating,checkout,describe_product_image,get_order_history,get_preferences,update_preferences],
     model = llm,
     system_prompt = (
         "You are a helpful shopping assistant. Follow these rules strictly.\n\n"
@@ -150,8 +249,21 @@ agent = create_agent(
         "1. Call describe_product_image with the path to identify the product.\n"
         "2. Use the returned search_query and is_organic to call search_products.\n"
         "3. Continue with the BROWSING flow from step 2 onwards.\n\n"
+        "MEMORY — preferences and order history:\n"
+        "1. At the start of a BROWSING request, call get_preferences once. If the user's\n"
+        "   current message does not state an organic preference or a max price, apply the\n"
+        "   saved values as default filters for this search. If the current message DOES\n"
+        "   state a filter, that overrides the saved preference for this search only.\n"
+        "2. If the user states a standing preference (e.g. 'I always want organic',\n"
+        "   'never show me anything over $20', 'stop showing me non-organic stuff'), call\n"
+        "   update_preferences to save it, briefly confirm it's saved, then continue with\n"
+        "   whatever else they asked for.\n"
+        "3. If the user asks about past orders ('what have I ordered before', 'did I already\n"
+        "   buy honey', 'show my order history'), call get_order_history and answer directly\n"
+        "   in plain text. Do not call search_products for this.\n\n"
         "BROWSING — when the user describes what they want to buy:\n"
         "1. Call search_products to find matching items (apply any price/organic filters given).\n"
+        "   or, per MEMORY step 1, saved preferences).\n"
         "2. For each candidate, call get_rating to retrieve its average rating.\n"
         "3. Filter by the user's minimum rating if specified.\n"
         "4. Present qualifying products as a numbered list. For each item use this exact format "
